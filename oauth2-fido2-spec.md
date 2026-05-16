@@ -289,11 +289,11 @@ Then:  HTTP 429
 #### TC-002-01 — Đăng nhập thành công
 
 ```
-Given: User có passkey hợp lệ
+Given: User có passkey hợp lệ, DB lưu sign_count = 5
        GET /oauth2/authorize với PKCE đúng chuẩn (S256)
-When:  POST /fido2/auth/finish với assertion hợp lệ
+When:  POST /fido2/auth/finish với assertion hợp lệ và authenticator trả về sign_count = 6
 Then:  HTTP 302 redirect → redirect_uri?code={auth_code}&state={state}
-       DB: sign_count tăng thêm 1, last_used_at = now()
+       DB: sign_count = 6, last_used_at = now() (persist đúng 1 lần sau khi verify signature thành công)
        Redis: Challenge bị xóa ngay lập tức
 ```
 
@@ -319,6 +319,7 @@ Given: User gọi /auth/begin thành công
 When:  User gửi /auth/finish với signature bị thay đổi 1 byte
 Then:  HTTP 401
        Body: { "error": "invalid_signature" }
+       DB: sign_count không đổi (không compare/persist counter khi signature chưa hợp lệ)
        Log: WARN | { user_id, ip, user_agent, timestamp, credential_id }
        Redis: Challenge bị xóa (không thể retry cùng challenge)
 ```
@@ -327,10 +328,11 @@ Then:  HTTP 401
 
 ```
 Given: DB lưu sign_count = 5 cho credential X
-When:  Authenticator trả về sign_count = 3 trong assertion
+When:  Assertion có signature hợp lệ nhưng authenticator trả về sign_count = 3
 Then:  HTTP 401
        Body: { "error": "sign_count_anomaly" }
-       DB: credential status = "suspended"
+       DB: credential status = "suspended"; sign_count vẫn = 5 (KHÔNG ghi đè bằng 3)
+       Redis: Challenge bị xóa (không thể retry cùng challenge)
        Alert: #security-alerts nhận thông báo ngay lập tức
        Log: ERROR | { credential_id, expected_min: 6, received: 3 }
 ```
@@ -524,9 +526,9 @@ Client                  Auth Server              FIDO2 Engine         Authentica
   │── POST /fido2/auth/finish ─►│                        │                     │
   │                           │── Verify assertion ───►│                     │
   │                           │   1. clientDataJSON type, challenge, origin   │
-  │                           │   2. authenticatorData rpIdHash, UV flag      │
-  │                           │   3. sign_count > stored_count                │
-  │                           │   4. verify(pubkey, sig, authData||clientHash)│
+  │                           │   2. authData rpIdHash, UP, UV flags          │
+  │                           │   3. verify(pubkey, sig, authData||clientHash)│
+  │                           │   4. compare sign_count after valid signature │
   │                           │◄── VERIFIED ───────────│                     │
   │                           │── Update sign_count ──►│(DB)                 │
   │◄── HTTP 302 + auth_code ──│                        │                     │
@@ -545,38 +547,46 @@ Client                  Auth Server              FIDO2 Engine         Authentica
 Input: assertionResponse = { id, rawId, response: { authenticatorData, clientDataJSON, signature, userHandle } }
 
 Step 1: Parse clientDataJSON
-  C = JSON.parse(base64url_decode(clientDataJSON))
+  clientDataJSON_bytes = base64url_decode(clientDataJSON)
+  C = JSON.parse(clientDataJSON_bytes)
   Assert C.type === "webauthn.get"
   Assert bytes_equal(base64url_decode(C.challenge), stored_challenge)  // byte compare, NOT string
   Assert C.origin === "https://yourdomain.com"
 
-Step 2: Compute hash
+Step 2: Compute clientDataHash
   clientDataHash = SHA-256(clientDataJSON_bytes)
 
 Step 3: Parse authenticatorData
-  rpIdHash = authenticatorData[0:32]
-  flags = authenticatorData[32]
-  signCount = authenticatorData[33:37] (big-endian uint32)
+  authenticatorData_bytes = base64url_decode(authenticatorData)
+  rpIdHash = authenticatorData_bytes[0:32]
+  flags = authenticatorData_bytes[32]
+  signCount = authenticatorData_bytes[33:37] (big-endian uint32)
 
-Step 4: Verify authenticatorData
+Step 4: Verify authenticatorData before trusting counters
   Assert rpIdHash === SHA-256("yourdomain.com")
   Assert flags.UP === 1       // User Presence required
   Assert flags.UV === 1       // User Verification required (policy: required)
-  
-Step 5: Verify sign count
-  If signCount > 0 AND signCount <= stored_sign_count:
-    → REJECT: sign_count_anomaly
-    → Suspend credential, alert security
-  Else:
-    → stored_sign_count = signCount  // update DB
 
-Step 6: Verify signature
-  verificationData = authenticatorData || clientDataHash
+Step 5: Verify signature before comparing sign_count
+  verificationData = authenticatorData_bytes || clientDataHash
   publicKey = fetch_public_key(credential_id)  // from DB, COSE format
   Assert verify_signature(publicKey, signature, verificationData) === true
 
+Step 6: Compare sign_count only after signature is valid
+  If stored_sign_count > 0 AND signCount > 0 AND signCount <= stored_sign_count:
+    → REJECT: sign_count_anomaly
+    → Suspend credential
+    → Delete challenge from Redis
+    → Alert security
+    → DO NOT update sign_count (keep stored_sign_count unchanged)
+    → STOP
+
+  next_sign_count = stored_sign_count
+  If signCount > stored_sign_count:
+    next_sign_count = signCount
+
 Step 7: On success
-  → Update sign_count in DB
+  → Persist exactly once: update sign_count = next_sign_count, last_used_at = now() in DB
   → Delete challenge from Redis
   → Issue authorization_code
 ```
