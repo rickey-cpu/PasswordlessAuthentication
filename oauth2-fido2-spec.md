@@ -89,6 +89,7 @@ Spec này định nghĩa việc tích hợp **FIDO2/WebAuthn (passkey)** vào Au
 | S-08 | Token introspection cho Resource Server |
 | S-09 | Admin revoke credential |
 | S-10 | Audit log cho mọi auth event |
+| S-11 | WebAuthn attestation conveyance `none` cho registration v1; không validate FIDO Metadata Service (MDS3) |
 
 ### Ngoài scope (v1)
 
@@ -99,7 +100,7 @@ Spec này định nghĩa việc tích hợp **FIDO2/WebAuthn (passkey)** vào Au
 | O-03 | Admin portal UI quản lý credential | UI sprint riêng |
 | O-04 | Step-up auth cho high-risk action | Phase 2 |
 | O-05 | Client Credentials grant | Không có use case hiện tại |
-| O-06 | FIDO2 Attestation verify với FIDO MDS3 | Performance concern, Phase 2 |
+| O-06 | FIDO2 Attestation verification với FIDO MDS3, trusted roots và provenance phần cứng | Phase 2; v1 chọn `attestation: "none"` để giảm operational complexity và không dùng attestation statement làm bằng chứng provenance |
 | O-07 | Biometrics enrollment UI | Phụ thuộc OS/device |
 
 ---
@@ -214,7 +215,7 @@ Spec này định nghĩa việc tích hợp **FIDO2/WebAuthn (passkey)** vào Au
 Given: User đã xác minh email, chưa có passkey, browser/device hỗ trợ WebAuthn
 When:  POST /fido2/register/begin với user_id hợp lệ
        → User hoàn thành sinh trắc học trên thiết bị
-       → POST /fido2/register/finish với attestation response hợp lệ
+       → POST /fido2/register/finish với WebAuthn registration response hợp lệ (`attestation=none`)
 Then:  HTTP 200
        Body: { "credential_id": "...", "message": "Passkey đã được thêm thành công" }
        DB: fido2_credentials có bản ghi mới với sign_count=0
@@ -294,12 +295,17 @@ Given: User có passkey hợp lệ, DB lưu sign_count = 5
 When:  POST /fido2/auth/finish với assertion hợp lệ và authenticator trả về sign_count = 6
 Then:  HTTP 302 redirect → redirect_uri?code={auth_code}&state={state}
        DB: sign_count = 6, last_used_at = now() (persist đúng 1 lần sau khi verify signature thành công)
-       Redis: Challenge bị xóa ngay lập tức
+       Redis: Transaction/challenge bị đánh dấu used và xóa ngay sau khi issue code
+       Redis: auth_code:{code} chứa các OAuth field đã bind từ transaction
 ```
 
 **Sample payload /auth/finish:**
+
+> Khuyến nghị: FIDO2 UI gửi request trong cùng browser session đã nhận cookie `__Host-auth_tx` (HttpOnly, Secure, SameSite=Lax/Strict) từ `GET /oauth2/authorize`. Nếu UI/native client cần reference rõ ràng, truyền thêm `auth_transaction_id` do server cấp; server vẫn phải đối chiếu với server-side session trước khi chấp nhận.
+
 ```json
 {
+  "auth_transaction_id": "atx_01HZY...",
   "id": "mfaFAs7FKdPlBDqo...",
   "rawId": "mfaFAs7FKdPlBDqo...",
   "type": "public-key",
@@ -320,8 +326,8 @@ When:  User gửi /auth/finish với signature bị thay đổi 1 byte
 Then:  HTTP 401
        Body: { "error": "invalid_signature" }
        DB: sign_count không đổi (không compare/persist counter khi signature chưa hợp lệ)
-       Log: WARN | { user_id, ip, user_agent, timestamp, credential_id }
-       Redis: Challenge bị xóa (không thể retry cùng challenge)
+       Log: WARN | { user_id, ip, user_agent, timestamp, credential_id, auth_transaction_id }
+       Redis: Transaction/challenge bị đánh dấu used/failed và xóa (không thể retry cùng challenge)
 ```
 
 #### TC-002-03 — Sign count giảm (clone attack)
@@ -332,7 +338,7 @@ When:  Assertion có signature hợp lệ nhưng authenticator trả về sign_c
 Then:  HTTP 401
        Body: { "error": "sign_count_anomaly" }
        DB: credential status = "suspended"; sign_count vẫn = 5 (KHÔNG ghi đè bằng 3)
-       Redis: Challenge bị xóa (không thể retry cùng challenge)
+       Redis: Transaction/challenge bị đánh dấu used/failed và xóa (không thể retry cùng challenge)
        Alert: #security-alerts nhận thông báo ngay lập tức
        Log: ERROR | { credential_id, expected_min: 6, received: 3 }
 ```
@@ -504,44 +510,73 @@ Then:  HTTP 400
 
 ### 7.1 Authorization Code Flow + FIDO2
 
+`GET /oauth2/authorize` là điểm tạo **server-side authentication transaction**. Sau khi validate `client_id`, `redirect_uri`, `scope`, `state`, PKCE và `nonce` (nếu dùng OIDC), Authorization Server tạo `auth_transaction_id` (ví dụ `atx_...`, entropy tối thiểu 128-bit), bind nó với `session_id` hiện tại và lưu toàn bộ OAuth context trong Redis. FIDO2 UI không được tự tái tạo OAuth field từ query string; mọi bước `/fido2/auth/begin` và `/fido2/auth/finish` phải tham chiếu lại transaction đã bind.
+
 ```
-Client                  Auth Server              FIDO2 Engine         Authenticator
-  │                          │                        │                     │
-  │── GET /oauth2/authorize ─►│                        │                     │
-  │   (client_id, scope,      │                        │                     │
-  │    code_challenge, state) │                        │                     │
-  │                           │── Create challenge ───►│                     │
-  │                           │◄─ challenge (32B) ─────│                     │
-  │◄── Redirect to FIDO2 UI ──│                        │                     │
-  │                           │                        │                     │
-  │── POST /fido2/auth/begin ─►│                        │                     │
-  │                           │── Store challenge ────►│(Redis, TTL 5m)      │
-  │◄── PublicKeyCredentialReq ─│                        │                     │
-  │                           │                        │                     │
-  │── navigator.credentials.get() ─────────────────────────────────────────►│
-  │                           │                        │          Sign(challenge,
-  │                           │                        │          private_key)│
-  │◄─────────────────────────────────────────────────── AssertionResponse ───│
-  │                           │                        │                     │
-  │── POST /fido2/auth/finish ─►│                        │                     │
-  │                           │── Verify assertion ───►│                     │
-  │                           │   1. clientDataJSON type, challenge, origin   │
-  │                           │   2. authData rpIdHash, UP, UV flags          │
-  │                           │   3. verify(pubkey, sig, authData||clientHash)│
-  │                           │   4. compare sign_count after valid signature │
-  │                           │◄── VERIFIED ───────────│                     │
-  │                           │── Update sign_count ──►│(DB)                 │
-  │◄── HTTP 302 + auth_code ──│                        │                     │
-  │                           │                        │                     │
-  │── POST /oauth2/token ─────►│                        │                     │
-  │   (code, code_verifier)   │── Verify code_verifier  │                     │
-  │                           │   SHA256(verifier) == challenge               │
-  │◄── access_token (15m) ────│                        │                     │
-  │    refresh_token (7d)     │                        │                     │
-  │    id_token               │                        │                     │
+Client                  Auth Server              FIDO2 Engine         Redis                 Authenticator
+  │                          │                        │                  │                         │
+  │── GET /oauth2/authorize ─►│                        │                  │                         │
+  │   (client_id, scope,      │                        │                  │                         │
+  │    redirect_uri, PKCE,    │                        │                  │                         │
+  │    state, nonce?)         │                        │                  │                         │
+  │                           │── Validate OAuth req ─►│                  │                         │
+  │                           │── Create auth_transaction_id + session_id │                         │
+  │                           │── Store oauth ctx + transaction ─────────►│ TTL 5m                  │
+  │◄── 302 FIDO2 UI + Set-Cookie __Host-auth_tx ───────│                  │                         │
+  │    (optional tx_ref)      │                        │                  │                         │
+  │                           │                        │                  │                         │
+  │── POST /fido2/auth/begin ─►│                        │                  │                         │
+  │   (same cookie, optional  │── Validate transaction/session binding ──►│                         │
+  │    auth_transaction_id)   │── Create FIDO2 challenge ────────────────►│ same auth_tx, TTL 5m    │
+  │◄── PublicKeyCredentialReq + auth_transaction_id ───│                  │                         │
+  │                           │                        │                  │                         │
+  │── navigator.credentials.get() ───────────────────────────────────────────────────────────────►│
+  │                           │                        │                  │          Sign(challenge, │
+  │                           │                        │                  │          private_key)    │
+  │◄──────────────────────────────────────────────────────────────────────── AssertionResponse ───│
+  │                           │                        │                  │                         │
+  │── POST /fido2/auth/finish ─►│                        │                  │                         │
+  │   (assertion + same       │── Load bound transaction/challenge ──────►│                         │
+  │    transaction ref)       │── Reject if missing/expired/mismatch/used │                         │
+  │                           │── Verify assertion ───►│                  │                         │
+  │                           │   1. clientDataJSON type, challenge, origin                         │
+  │                           │   2. authenticatorData rpIdHash, UP, UV flags                       │
+  │                           │   3. verify(pubkey, sig, authData||clientHash)                       │
+  │                           │   4. compare sign_count after valid signature                        │
+  │                           │◄── VERIFIED ───────────│                  │                         │
+  │                           │── Persist sign_count once ─►│(DB)          │                         │
+  │                           │── Issue auth_code only for bound tx ─────►│ auth_code copies bound OAuth ctx
+  │                           │── Mark tx used/delete challenge ────────►│ anti-replay             │
+  │◄── HTTP 302 + auth_code ──│                        │                  │                         │
+  │                           │                        │                  │                         │
+  │── POST /oauth2/token ─────►│                        │                  │                         │
+  │   (code, code_verifier)   │── Verify code_verifier against copied PKCE                         │
+  │                           │   SHA256(verifier) == code_challenge                                 │
+  │◄── access_token (15m) ────│                        │                  │                         │
+  │    refresh_token (7d)     │                        │                  │                         │
+  │    id_token               │                        │                  │                         │
 ```
 
-### 7.2 FIDO2 Verification Logic (RFC W3C §7.2)
+**Transaction binding rules:**
+
+- `auth_transaction_id` được tạo duy nhất tại `GET /oauth2/authorize`; không chấp nhận ID do client tự sinh.
+- Redis transaction phải lưu: `client_id`, `redirect_uri` đã validate/canonicalized, `scope`, `state`, `code_challenge`, `code_challenge_method`, `nonce` (nếu OIDC), `session_id`, `created_at`, `expires_at`, `status=pending`, và FIDO2 challenge metadata (`challenge_b64`, `rp_id`, `origin`, `allow_credentials`, `user_verification`, `challenge_created_at`).
+- FIDO2 UI ưu tiên dùng cookie server-side `__Host-auth_tx`/`session_id` với `HttpOnly`, `Secure`, `SameSite=Lax` hoặc `Strict`. `auth_transaction_id` trong body/query chỉ là transaction reference để debug/mobile-deep-link và phải khớp với cookie/session đã bind.
+- `/fido2/auth/begin` chỉ tạo FIDO2 auth challenge cho transaction `pending` còn hạn và cùng `session_id`; nếu transaction đã có challenge chưa hết hạn thì rotate challenge cũ và đánh dấu cũ là unusable.
+- `/fido2/auth/finish` chỉ được issue authorization code khi assertion hợp lệ **và** transaction vẫn `pending`, cùng `session_id`, cùng `auth_transaction_id`, challenge chưa hết hạn và chưa dùng. Khi tạo `auth_code:{code}`, server copy OAuth field đã bind từ transaction (`client_id`, `redirect_uri`, `scope`, `state`, `code_challenge`, `code_challenge_method`, `nonce`) thay vì lấy từ request `/finish`.
+- Sau khi issue code hoặc khi verification thất bại không thể retry an toàn, transaction/challenge phải được đánh dấu `used`/`failed` bằng thao tác atomic (ví dụ Redis Lua/SET NX state transition) rồi xóa hoặc giữ tombstone TTL ngắn để chặn replay.
+
+**Reject cases bắt buộc:**
+
+| Trường hợp | HTTP | Error | Ghi chú |
+|---|---:|---|---|
+| Thiếu cookie/session hoặc thiếu transaction reference khi endpoint yêu cầu | 400 | `missing_auth_transaction` | Không bắt đầu WebAuthn nếu không có transaction OAuth đã bind |
+| `auth_transaction_id` không tồn tại hoặc TTL hết hạn | 400 | `auth_transaction_expired` | User phải restart từ `/oauth2/authorize` |
+| Transaction không khớp `session_id`, cookie, `client_id` context hoặc challenge trong assertion | 400 | `auth_transaction_mismatch` | Log WARN, không issue code |
+| Transaction/challenge đã `used`, `failed` hoặc có replay cùng assertion | 400 | `auth_transaction_replayed` | Không cho retry cùng challenge |
+| `/finish` hợp lệ về FIDO2 nhưng transaction chưa được bind từ `/authorize` | 400 | `unbound_auth_transaction` | Không tạo `auth_code` |
+
+### 7.2 FIDO2 Verification Logic (W3C WebAuthn §7.1/§7.2)
 
 ```
 Input: assertionResponse = { id, rawId, response: { authenticatorData, clientDataJSON, signature, userHandle } }
@@ -556,39 +591,87 @@ Step 1: Parse clientDataJSON
 Step 2: Compute clientDataHash
   clientDataHash = SHA-256(clientDataJSON_bytes)
 
-Step 3: Parse authenticatorData
+Step 3: Resolve credential record before trust decisions
+  credential = find_by_credential_id(rawId || id)
+  Assert credential.status === "active"
+  If allowCredentials was present in /begin:
+    Assert credential.id is in stored allowCredentials for this auth_tx
+  If discoverable credential flow returns userHandle:
+    Assert userHandle maps to credential.user_id and the bound OAuth login subject
+
+Step 4: Parse authenticatorData
   authenticatorData_bytes = base64url_decode(authenticatorData)
   rpIdHash = authenticatorData_bytes[0:32]
   flags = authenticatorData_bytes[32]
   signCount = authenticatorData_bytes[33:37] (big-endian uint32)
 
-Step 4: Verify authenticatorData before trusting counters
+Step 5: Verify authenticatorData before trusting counters
   Assert rpIdHash === SHA-256("yourdomain.com")
   Assert flags.UP === 1       // User Presence required
   Assert flags.UV === 1       // User Verification required (policy: required)
+  Assert unexpected extension outputs are ignored unless allowlisted by policy
 
-Step 5: Verify signature before comparing sign_count
+Step 6: Verify signature before comparing sign_count or mutating persistent state
   verificationData = authenticatorData_bytes || clientDataHash
-  publicKey = fetch_public_key(credential_id)  // from DB, COSE format
+  publicKey = credential.public_key_cose  // from DB, converted to verifier-native key
   Assert verify_signature(publicKey, signature, verificationData) === true
 
-Step 6: Compare sign_count only after signature is valid
-  If stored_sign_count > 0 AND signCount > 0 AND signCount <= stored_sign_count:
+Step 7: Compare sign_count only after signature is valid
+  If signCount > 0 AND stored_sign_count > 0 AND signCount <= stored_sign_count:
     → REJECT: sign_count_anomaly
     → Suspend credential
-    → Delete challenge from Redis
+    → Atomically mark auth_tx failed/used and delete/expire FIDO2 challenge metadata
     → Alert security
     → DO NOT update sign_count (keep stored_sign_count unchanged)
     → STOP
 
-  next_sign_count = stored_sign_count
-  If signCount > stored_sign_count:
-    next_sign_count = signCount
+  next_sign_count = max(stored_sign_count, signCount)
+  Note: Some synced/passkey authenticators may report signCount=0. Do not reject 0 solely
+  because it is not greater than stored_count; rely on challenge one-time-use, UV, signature,
+  risk policy, and audit monitoring for those authenticators.
 
-Step 7: On success
-  → Persist exactly once: update sign_count = next_sign_count, last_used_at = now() in DB
-  → Delete challenge from Redis
-  → Issue authorization_code
+Step 8: On success
+  → Persist exactly once: update credential.sign_count = next_sign_count, last_used_at = now()
+  → Atomically mark auth_tx as used and delete/expire FIDO2 challenge metadata
+  → Issue authorization_code only from the bound auth_tx OAuth context
+  → Persist auth_code:{code} with copied client_id, redirect_uri, scope, state, PKCE, nonce
+```
+
+**Registration finish verification (`/fido2/register/finish`):**
+
+```
+Input: attestationResponse = { id, rawId, response: { attestationObject, clientDataJSON, transports } }
+
+Step 1: Load and lock registration challenge
+  Assert reg:{session_id/user_id}.challenge exists, pending, and not used
+  Assert user.email_verified === true and user.status === "active"
+
+Step 2: Parse clientDataJSON
+  C = JSON.parse(base64url_decode(clientDataJSON))
+  Assert C.type === "webauthn.create"
+  Assert bytes_equal(base64url_decode(C.challenge), stored_registration_challenge)
+  Assert C.origin === "https://yourdomain.com"
+
+Step 3: Parse attestationObject.authData
+  Assert rpIdHash === SHA-256("yourdomain.com")
+  Assert flags.UP === 1 and flags.UV === 1
+  Extract credential_id, public_key_cose, signCount, aaguid, backup flags, extensions
+
+Step 4: Enforce local credential policy
+  Assert credential_id is not already present globally or for the user
+  Assert public_key_cose.alg in allowed algorithms [-7, -257]
+  Assert excludeCredentials from /begin did not match the new credential
+  Store aaguid as diagnostic metadata only; do not map it to assurance in v1
+
+Step 5: Apply v1 attestation policy
+  Assert request options used attestation="none"
+  Treat attestation statement validation as not required for v1
+  Do not call FIDO MDS3, do not trust certificate chain/AAGUID for hardware provenance
+
+Step 6: Commit registration atomically
+  Insert fido2_credentials with sign_count = max(0, signCount), status="active"
+  Mark registration challenge used and delete/expire Redis key
+  Write auth_audit_log event=passkey_registered and send confirmation email
 ```
 
 ### 7.3 Registration Ceremony
@@ -600,15 +683,19 @@ Step 1: POST /fido2/register/begin
     - excludeCredentials: [tất cả credential_id của user]  // tránh đăng ký trùng
     - authenticatorSelection.residentKey = "required"       // discoverable credential
     - authenticatorSelection.userVerification = "required"
-    - attestation = "indirect"
+    - attestation = "none"                         // v1 không yêu cầu attestation statement
 
 Step 2: Client gọi navigator.credentials.create(options)
-  Authenticator tạo key pair, lưu private key trong secure enclave
-  Trả về attestationObject + clientDataJSON
+  Authenticator tạo key pair, lưu private key trong authenticator
+  Trả về attestationObject + clientDataJSON; với policy `none`, browser không cung cấp
+  attestation statement/cert chain nào có thể dùng để chứng minh provenance phần cứng.
 
 Step 3: POST /fido2/register/finish
-  Server verify attestation statement (format: none / packed / tpm / android-key / fido-u2f)
-  Server lưu: credential_id, public_key_cose, aaguid, transports, backup_eligible, backup_state
+  Server verify registration theo WebAuthn: challenge, origin, rpIdHash, type, UV flag,
+  credential_id uniqueness, public_key_cose và thuật toán được phép.
+  Server KHÔNG verify attestation statement, KHÔNG gọi FIDO MDS3, KHÔNG tin AAGUID/cert
+  như bằng chứng provenance phần cứng trong v1.
+  Server lưu: credential_id, public_key_cose, aaguid (diagnostic only), transports, backup_eligible, backup_state
   Server xóa challenge khỏi Redis
   Server gửi email xác nhận
 ```
@@ -648,10 +735,25 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
+    IntrospectionAuth:
+      type: oauth2
+      description: |
+        Confidential/service client authentication for Resource Servers.
+        Use a client credential or service account access token carrying scope `tokens:introspect`;
+        do not use an end-user access token to authenticate this endpoint.
+      flows:
+        clientCredentials:
+          tokenUrl: /oauth2/token
+          scopes:
+            tokens:introspect: Validate and introspect access tokens for Resource Servers.
     AdminAuth:
-      type: http
-      scheme: bearer
-      description: Requires scope=admin:write
+      type: oauth2
+      description: Admin bearer token; accepted on introspection only as an explicit admin override.
+      flows:
+        clientCredentials:
+          tokenUrl: /oauth2/token
+          scopes:
+            admin:write: Administrative write access.
 
   schemas:
     Error:
@@ -709,7 +811,7 @@ components:
           properties:
             userVerification: { type: string, enum: [required] }
             residentKey: { type: string, enum: [required] }
-        attestation: { type: string, enum: [none, indirect, direct], default: indirect }
+        attestation: { type: string, enum: [none], default: none, description: "v1 dùng attestation conveyance none; server không validate FIDO MDS3 hoặc dùng attestation statement làm bằng chứng provenance phần cứng" }
 
     RegisterFinishRequest:
       type: object
@@ -737,12 +839,23 @@ components:
     # --- Authentication ---
     AuthBeginRequest:
       type: object
+      description: |
+        FIDO2 UI phải gọi endpoint này trong cùng server-side browser session đã được tạo bởi
+        GET /oauth2/authorize. Cookie HttpOnly/SameSite là nguồn bind chính; auth_transaction_id
+        chỉ là transaction reference rõ ràng cho UI/native client và phải khớp với session.
       properties:
+        auth_transaction_id:
+          type: string
+          pattern: '^atx_[A-Za-z0-9_-]{22,}$'
+          description: Optional khi cookie __Host-auth_tx hiện diện; bắt buộc cho native/deep-link flow.
         user_id: { type: string, format: uuid, description: Để trống nếu dùng discoverable credential }
 
     AuthBeginResponse:
       type: object
       properties:
+        auth_transaction_id:
+          type: string
+          description: Server-issued transaction reference đã bind với session; echo lại để UI gửi /finish khi cần.
         challenge: { type: string, format: base64url }
         timeout: { type: integer, example: 300000 }
         rpId: { type: string, example: yourcompany.com }
@@ -759,7 +872,14 @@ components:
     AuthFinishRequest:
       type: object
       required: [id, rawId, type, response]
+      description: |
+        Hoàn tất assertion trong transaction đã bind. Server chỉ issue authorization code nếu
+        auth_transaction_id/cookie/session khớp với transaction pending và challenge chưa dùng.
       properties:
+        auth_transaction_id:
+          type: string
+          pattern: '^atx_[A-Za-z0-9_-]{22,}$'
+          description: Optional khi cookie __Host-auth_tx đủ để lookup; nếu truyền thì phải khớp tuyệt đối.
         id: { type: string, format: base64url }
         rawId: { type: string, format: base64url }
         type: { type: string, enum: [public-key] }
@@ -865,7 +985,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/RegisterFinishResponse' }
         '400':
-          description: Challenge hết hạn hoặc attestation không hợp lệ
+          description: Challenge hết hạn hoặc WebAuthn registration response không hợp lệ
           content:
             application/json:
               examples:
@@ -883,10 +1003,19 @@ paths:
             schema: { $ref: '#/components/schemas/AuthBeginRequest' }
       responses:
         '200':
-          description: PublicKeyCredentialRequestOptions
+          description: PublicKeyCredentialRequestOptions kèm transaction reference đã bind
           content:
             application/json:
               schema: { $ref: '#/components/schemas/AuthBeginResponse' }
+        '400':
+          description: Transaction thiếu, hết hạn, không khớp hoặc replay
+          content:
+            application/json:
+              examples:
+                missing_tx: { value: { error: missing_auth_transaction } }
+                expired_tx: { value: { error: auth_transaction_expired } }
+                mismatch_tx: { value: { error: auth_transaction_mismatch } }
+                replayed_tx: { value: { error: auth_transaction_replayed } }
         '429':
           description: Rate limit — 5 lần/phút/IP
           headers:
@@ -904,17 +1033,24 @@ paths:
             schema: { $ref: '#/components/schemas/AuthFinishRequest' }
       responses:
         '302':
-          description: Redirect về client kèm authorization_code
+          description: |
+            Redirect về client kèm authorization_code. Code chỉ được issue cho transaction đã bind;
+            auth_code:{code} phải copy client_id, redirect_uri, scope, state, PKCE và nonce từ Redis transaction.
           headers:
             Location: { schema: { type: string, format: uri } }
         '400':
-          description: Origin mismatch, challenge expired, UV=0
+          description: Origin mismatch, challenge expired, UV=0, hoặc auth transaction không hợp lệ
           content:
             application/json:
               examples:
                 origin: { value: { error: origin_mismatch } }
                 expired: { value: { error: challenge_expired } }
                 uv: { value: { error: user_verification_required } }
+                missing_tx: { value: { error: missing_auth_transaction } }
+                expired_tx: { value: { error: auth_transaction_expired } }
+                mismatch_tx: { value: { error: auth_transaction_mismatch } }
+                replayed_tx: { value: { error: auth_transaction_replayed } }
+                unbound_tx: { value: { error: unbound_auth_transaction } }
         '401':
           description: Signature không hợp lệ hoặc sign_count anomaly
           content:
@@ -977,8 +1113,19 @@ paths:
         - { name: state, in: query, required: true, schema: { type: string, minLength: 16 } }
         - { name: code_challenge, in: query, required: true, schema: { type: string, format: base64url } }
         - { name: code_challenge_method, in: query, required: true, schema: { type: string, enum: [S256] } }
+        - { name: nonce, in: query, required: false, schema: { type: string, minLength: 16 }, description: Bắt buộc khi scope chứa openid nếu policy OIDC yêu cầu nonce }
       responses:
-        '302': { description: Redirect đến FIDO2 authentication UI }
+        '302':
+          description: |
+            Redirect đến FIDO2 authentication UI sau khi tạo auth_transaction_id server-side,
+            bind với session_id và lưu OAuth context đã validate trong Redis.
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+              description: FIDO2 UI URL; có thể chứa tx_ref ngắn, không chứa OAuth secret/context.
+            Set-Cookie:
+              schema: { type: string }
+              description: __Host-auth_tx=<opaque>; HttpOnly; Secure; SameSite=Lax hoặc Strict; TTL 5m.
         '400': { description: Request không hợp lệ (missing param, invalid redirect_uri) }
 
   /oauth2/token:
@@ -1008,9 +1155,15 @@ paths:
   /oauth2/introspect:
     post:
       summary: Validate token (dùng cho Resource Server)
+      description: |
+        Resource Server MUST authenticate as a confidential/service client.
+        Required scope is `tokens:introspect`; `admin:write` is accepted only for Admin clients that need
+        to call this endpoint. End-user access tokens MUST NOT be used as the caller credential.
       operationId: introspect
       tags: [oauth2]
-      security: [{ AdminAuth: [] }]
+      security:
+        - IntrospectionAuth: [tokens:introspect]
+        - AdminAuth: [admin:write]
       requestBody:
         required: true
         content:
@@ -1032,6 +1185,28 @@ paths:
                   scope: { type: string }
                   exp: { type: integer }
                   amr: { type: array, items: { type: string } }
+        '401':
+          description: Missing or invalid Resource Server credential
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                missing_credential:
+                  value:
+                    error: invalid_client
+                    message: Missing bearer token or client authentication for token introspection.
+                    request_id: 018f9d0a-91b4-7cc6-a5d2-4b0ed2b7159d
+        '403':
+          description: Caller is authenticated but lacks the required introspection scope
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                missing_scope:
+                  value:
+                    error: insufficient_scope
+                    message: Required scope `tokens:introspect` or admin override scope `admin:write`.
+                    request_id: 018f9d0b-2254-73a5-9c15-3bb7dcda6e62
 
   /oauth2/revoke:
     post:
@@ -1097,7 +1272,7 @@ paths:
       summary: Admin revoke tất cả credential của user
       operationId: adminRevokeAllCredentials
       tags: [admin]
-      security: [{ AdminAuth: [] }]
+      security: [{ AdminAuth: [admin:write] }]
       parameters:
         - name: user_id
           in: path
@@ -1143,7 +1318,7 @@ CREATE TABLE fido2_credentials (
   transports           TEXT[],          -- ['internal','hybrid','usb','nfc','ble']
   backup_eligible      BOOLEAN NOT NULL DEFAULT false,
   backup_state         BOOLEAN NOT NULL DEFAULT false,
-  attestation_format   TEXT,            -- 'none' | 'packed' | 'tpm' | 'android-key' | 'fido-u2f'
+  attestation_format   TEXT,            -- v1 expected 'none'; diagnostic only, không dùng làm provenance
   status               TEXT NOT NULL DEFAULT 'active'
                        CHECK (status IN ('active', 'suspended', 'revoked')),
   created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -1230,12 +1405,37 @@ CREATE INDEX idx_audit_event ON auth_audit_log(event_type, created_at DESC);
 -- =====================================================
 -- Redis Keys (không phải DB table — documentation only)
 -- =====================================================
--- Key: "challenge:reg:{session_id}"    Value: { challenge_b64, user_id }  TTL: 300s
--- Key: "challenge:auth:{session_id}"   Value: { challenge_b64, user_id }  TTL: 300s
--- Key: "auth_code:{code}"              Value: { user_id, client_id, scope, redirect_uri, code_challenge, amr }  TTL: 600s
+-- Key: "challenge:reg:{session_id}"
+--   Value: { challenge_b64, user_id, created_at, rp_id, origin }
+--   TTL: 300s
+--
+-- Key: "auth_tx:{auth_transaction_id}"
+--   Value: {
+--     session_id, status: "pending" | "used" | "failed", created_at, expires_at,
+--     client_id, redirect_uri_validated, scope, state,
+--     code_challenge, code_challenge_method, nonce,
+--     fido2: {
+--       challenge_b64, challenge_created_at, rp_id, origin,
+--       allow_credentials, user_verification, timeout_ms
+--     }
+--   }
+--   TTL: 300s while pending; tombstone TTL 60s after used/failed to reject replay
+--
+-- Key: "challenge:auth:{session_id}"
+--   Deprecated: chỉ dùng migration. Auth challenge mới phải nằm trong auth_tx:{auth_transaction_id}
+--   để bind OAuth context + FIDO2 challenge atomically. TTL: 300s
+--
+-- Key: "auth_code:{code}"
+--   Value: {
+--     user_id, client_id, redirect_uri, scope, state,
+--     code_challenge, code_challenge_method, nonce,
+--     auth_transaction_id, session_id, amr: ["fido2"], issued_at
+--   }
+--   TTL: 600s; tất cả OAuth field phải copy từ auth_tx đã bind, không lấy từ /fido2/auth/finish
+--
 -- Key: "recovery_otp:{email_hash}"     Value: { otp_hash, attempts }      TTL: 600s
 -- Key: "recovery_token:{token_hash}"   Value: { user_id }                 TTL: 900s
--- Key: "session:{session_id}"          Value: { user_id, created_at }     TTL: 3600s
+-- Key: "session:{session_id}"          Value: { user_id, created_at, auth_transaction_id? } TTL: 3600s
 ```
 
 ---
@@ -1248,8 +1448,10 @@ CREATE INDEX idx_audit_event ON auth_audit_log(event_type, created_at DESC);
 |---|---|---|
 | End user | `openid profile email fido2:register fido2:auth credentials:read credentials:delete offline_access` | Người dùng cuối |
 | Support T2 | `support:read credentials:read audit:read:own` | Nhân viên hỗ trợ tier 2 |
-| Admin | `admin:read admin:write credentials:revoke tokens:revoke tokens:introspect oauth2:clients:manage audit:read` | Quản trị hệ thống |
-| Service account | `tokens:introspect` | Machine-to-machine |
+| Admin | `admin:read admin:write credentials:revoke tokens:revoke oauth2:clients:manage audit:read` + optional `admin:write` override for `/oauth2/introspect` | Quản trị hệ thống |
+| Service account | `tokens:introspect` | Machine-to-machine Resource Server client |
+
+**Introspection rule:** `/oauth2/introspect` requires caller scope `tokens:introspect`. Resource Servers MUST call it with a confidential/service client credential, not an end-user access token. `admin:write` is also accepted only as an Admin override when operators need to introspect tokens.
 
 ### Ma trận quyền
 
@@ -1264,7 +1466,7 @@ CREATE INDEX idx_audit_event ON auth_audit_log(event_type, created_at DESC);
 | DELETE /admin/users/:id/credentials | ✗ | ✗ | ✓ | ✗ |
 | GET /oauth2/authorize | ✓ | ✗ | ✗ | ✗ |
 | POST /oauth2/token | ✓ | ✗ | ✗ | ✗ |
-| POST /oauth2/introspect | ✗ | ✗ | ✓ | ✓ |
+| POST /oauth2/introspect | ✗ | ✗ | ✓ (`admin:write` override) | ✓ (`tokens:introspect`) |
 | POST /oauth2/revoke | ✓ own | ✗ | ✓ any | ✗ |
 | GET /.well-known/jwks.json | ✓ | ✓ | ✓ | ✓ |
 | GET /admin/users/:id | ✗ | ✓ | ✓ | ✗ |
@@ -1289,8 +1491,9 @@ CREATE INDEX idx_audit_event ON auth_audit_log(event_type, created_at DESC);
 | `userVerification` | `required` | Bắt buộc PIN/biometric, không chỉ user presence |
 | `rpId` | `yourcompany.com` | Không wildcard subdomain |
 | `timeout` | `300000` ms | 5 phút — đủ cho user thao tác |
-| `attestation` | `indirect` | Verify qua FIDO MDS, không trực tiếp process cert chain |
+| `attestation` | `none` | v1 không thu thập/verify attestation statement, không gọi FIDO MDS3, và không dùng AAGUID/cert chain làm bằng chứng provenance phần cứng |
 | `residentKey` | `required` | Discoverable credential — login không cần nhập username |
+| Hardware provenance | Không được chứng minh bằng attestation trong v1 | Scope high-assurance như `admin:write` không được grant chỉ dựa trên attestation statement; cần policy bổ sung hoặc Phase 2 MDS3 |
 
 ### Rate Limiting
 
@@ -1709,6 +1912,36 @@ RFC 7636 định nghĩa hai method: `plain` (code_verifier = code_challenge) và
 
 ---
 
+### ADR-006: Chọn `attestation: "none"` cho v1 và defer FIDO MDS3
+
+**Status:** Accepted\
+**Date:** 2026-05-16\
+**Deciders:** Security Lead, Backend Lead, Infra Lead
+
+**Context:**
+Registration có thể yêu cầu attestation để xác minh model authenticator và provenance phần cứng qua FIDO Metadata Service v3 (MDS3). Lựa chọn này tăng assurance, nhưng kéo theo vận hành trusted roots, refresh metadata định kỳ, cache, xử lý outage, revocation/status report và latency khi registration. v1 cần passkey rollout ổn định, latency thấp và ít dependency vận hành.
+
+**Quyết định:** v1 dùng WebAuthn `attestation: "none"`. Server không validate FIDO MDS3, không xử lý attestation certificate chain/trusted roots, và không dùng attestation statement/AAGUID/cert chain làm bằng chứng provenance phần cứng.
+
+**Hệ quả bảo mật:**
+- Registration vẫn verify các yêu cầu WebAuthn core: challenge, origin, rpIdHash, type, UV flag, credential uniqueness, public key và thuật toán được phép.
+- AAGUID và transports chỉ dùng cho diagnostic/risk analytics, không dùng để grant assurance level.
+- Không thể chứng minh bằng cryptographic metadata rằng credential đến từ hardware authenticator cụ thể trong v1.
+
+**Tác động đến high-assurance scope (`admin:write`):**
+- `admin:write` không được cấp chỉ vì registration response có attestation-like data; v1 coi dữ liệu đó là không đáng tin cho provenance.
+- Nếu business bắt buộc hardware provenance cho `admin:write`, endpoint phải trả `insufficient_assurance` cho đến khi có policy ngoài luồng được Security phê duyệt hoặc Phase 2 MDS3 được triển khai.
+- Tín hiệu như `backup_state=false` có thể dùng để giảm rủi ro synced passkey, nhưng không thay thế MDS3 attestation verification.
+
+**Trade-offs:**
+- Ưu điểm: giảm dependency vận hành, tránh failure mode khi MDS/cache/trusted roots lỗi, registration nhanh và dễ rollout hơn.
+- Nhược điểm: không có provenance phần cứng trong v1; một số use case high-assurance phải bị hạn chế hoặc cần exception được audit.
+
+**Follow-up Phase 2 (ngoài scope v1):**
+Khi đưa MDS3 vào scope, cần thiết kế metadata refresh schedule, signed TOC verification, cache TTL/stale behavior, failure handling, trusted roots management, status report handling và monitoring.
+
+---
+
 ## 17. Traceability Matrix
 
 > Bảng này link từng User Story → Acceptance Criteria → Endpoint → DB Table → NFR để đảm bảo không có gì bị bỏ sót khi requirement thay đổi.
@@ -1756,7 +1989,8 @@ RFC 7636 định nghĩa hai method: `plain` (code_verifier = code_challenge) và
 | Origin mismatch (phishing attempt) | /fido2/auth/finish | HTTP 400 | Log ERROR, monitor spike |
 | Challenge timeout | /fido2/auth/finish | HTTP 400 `challenge_expired` | Không, user restart flow |
 | PR > 500 dòng thay đổi | — | Không có | NEEDS_HUMAN review |
-| Attestation format lạ | /fido2/register/finish | Accept nếu `attestation=none`, reject nếu invalid format | Log WARNING |
+| Attestation statement/provenance phần cứng xuất hiện hoặc thiếu | /fido2/register/finish | Với policy `attestation=none`, chỉ verify WebAuthn core fields; không dùng statement/AAGUID/cert chain để chứng minh hardware provenance | Log INFO nếu client gửi dữ liệu ngoài kỳ vọng |
+| Request `admin:write` nhưng credential không có provenance được policy chấp nhận | /fido2/auth/finish hoặc /oauth2/authorize | HTTP 403 `insufficient_assurance`; v1 không coi attestation statement là bằng chứng, Phase 2 MDS3 mới có thể nâng assurance | Security review nếu business cần allowlist tạm |
 | Redis down | Mọi FIDO2 endpoint | HTTP 503 + Retry-After, circuit breaker | PagerDuty alert |
 | DB connection exhausted | Mọi endpoint | HTTP 503, queue request tối đa 30s | PagerDuty alert |
 | Synced passkey cho high-assurance | /fido2/auth/finish | HTTP 403 `insufficient_assurance` | Không, user dùng hardware key |
