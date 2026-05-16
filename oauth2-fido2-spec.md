@@ -574,7 +574,7 @@ Client                  Auth Server              FIDO2 Engine         Redis     
 | Transaction/challenge đã `used`, `failed` hoặc có replay cùng assertion | 400 | `auth_transaction_replayed` | Không cho retry cùng challenge |
 | `/finish` hợp lệ về FIDO2 nhưng transaction chưa được bind từ `/authorize` | 400 | `unbound_auth_transaction` | Không tạo `auth_code` |
 
-### 7.2 FIDO2 Verification Logic (RFC W3C §7.2)
+### 7.2 FIDO2 Verification Logic (W3C WebAuthn §7.1/§7.2)
 
 ```
 Input: assertionResponse = { id, rawId, response: { authenticatorData, clientDataJSON, signature, userHandle } }
@@ -588,33 +588,82 @@ Step 1: Parse clientDataJSON
 Step 2: Compute hash
   clientDataHash = SHA-256(clientDataJSON_bytes)
 
-Step 3: Parse authenticatorData
+Step 3: Resolve credential record before trust decisions
+  credential = find_by_credential_id(rawId || id)
+  Assert credential.status === "active"
+  If allowCredentials was present in /begin:
+    Assert credential.id is in stored allowCredentials for this auth_tx
+  If discoverable credential flow returns userHandle:
+    Assert userHandle maps to credential.user_id and the bound OAuth login subject
+
+Step 4: Parse authenticatorData
   rpIdHash = authenticatorData[0:32]
   flags = authenticatorData[32]
   signCount = authenticatorData[33:37] (big-endian uint32)
 
-Step 4: Verify authenticatorData
+Step 5: Verify authenticatorData
   Assert rpIdHash === SHA-256("yourdomain.com")
   Assert flags.UP === 1       // User Presence required
   Assert flags.UV === 1       // User Verification required (policy: required)
-  
-Step 5: Verify sign count
-  If signCount > 0 AND signCount <= stored_sign_count:
-    → REJECT: sign_count_anomaly
-    → Suspend credential, alert security
-  Else:
-    → stored_sign_count = signCount  // update DB
+  Assert unexpected extension outputs are ignored unless allowlisted by policy
 
-Step 6: Verify signature
+Step 6: Verify signature before mutating persistent state
   verificationData = authenticatorData || clientDataHash
-  publicKey = fetch_public_key(credential_id)  // from DB, COSE format
+  publicKey = credential.public_key_cose  // from DB, converted to verifier-native key
   Assert verify_signature(publicKey, signature, verificationData) === true
 
-Step 7: On success
-  → Update sign_count in DB
+Step 7: Verify sign count and update atomically
+  If signCount > 0 AND stored_sign_count > 0 AND signCount <= stored_sign_count:
+    → REJECT: sign_count_anomaly
+    → Suspend credential, alert security, mark auth_tx failed/used to block replay
+  Else:
+    → Update credential.sign_count = max(stored_sign_count, signCount)
+    → Update credential.last_used_at = now()
+  Note: Some synced/passkey authenticators may report signCount=0. Do not reject 0 solely
+  because it is not greater than stored_count; rely on challenge one-time-use, UV, signature,
+  risk policy, and audit monitoring for those authenticators.
+
+Step 8: On success
   → Atomically mark auth_tx as used and delete/expire FIDO2 challenge metadata
   → Issue authorization_code only from the bound auth_tx OAuth context
   → Persist auth_code:{code} with copied client_id, redirect_uri, scope, state, PKCE, nonce
+```
+
+**Registration finish verification (`/fido2/register/finish`):**
+
+```
+Input: attestationResponse = { id, rawId, response: { attestationObject, clientDataJSON, transports } }
+
+Step 1: Load and lock registration challenge
+  Assert reg:{session_id/user_id}.challenge exists, pending, and not used
+  Assert user.email_verified === true and user.status === "active"
+
+Step 2: Parse clientDataJSON
+  C = JSON.parse(base64url_decode(clientDataJSON))
+  Assert C.type === "webauthn.create"
+  Assert bytes_equal(base64url_decode(C.challenge), stored_registration_challenge)
+  Assert C.origin === "https://yourdomain.com"
+
+Step 3: Parse attestationObject.authData
+  Assert rpIdHash === SHA-256("yourdomain.com")
+  Assert flags.UP === 1 and flags.UV === 1
+  Extract credential_id, public_key_cose, signCount, aaguid, backup flags, extensions
+
+Step 4: Enforce local credential policy
+  Assert credential_id is not already present globally or for the user
+  Assert public_key_cose.alg in allowed algorithms [-7, -257]
+  Assert excludeCredentials from /begin did not match the new credential
+  Store aaguid as diagnostic metadata only; do not map it to assurance in v1
+
+Step 5: Apply v1 attestation policy
+  Assert request options used attestation="none"
+  Treat attestation statement validation as not required for v1
+  Do not call FIDO MDS3, do not trust certificate chain/AAGUID for hardware provenance
+
+Step 6: Commit registration atomically
+  Insert fido2_credentials with sign_count = max(0, signCount), status="active"
+  Mark registration challenge used and delete/expire Redis key
+  Write auth_audit_log event=passkey_registered and send confirmation email
 ```
 
 ### 7.3 Registration Ceremony
