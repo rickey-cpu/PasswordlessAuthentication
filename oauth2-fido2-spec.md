@@ -89,6 +89,7 @@ Spec này định nghĩa việc tích hợp **FIDO2/WebAuthn (passkey)** vào Au
 | S-08 | Token introspection cho Resource Server |
 | S-09 | Admin revoke credential |
 | S-10 | Audit log cho mọi auth event |
+| S-11 | WebAuthn attestation conveyance `none` cho registration v1; không validate FIDO Metadata Service (MDS3) |
 
 ### Ngoài scope (v1)
 
@@ -99,7 +100,7 @@ Spec này định nghĩa việc tích hợp **FIDO2/WebAuthn (passkey)** vào Au
 | O-03 | Admin portal UI quản lý credential | UI sprint riêng |
 | O-04 | Step-up auth cho high-risk action | Phase 2 |
 | O-05 | Client Credentials grant | Không có use case hiện tại |
-| O-06 | FIDO2 Attestation verify với FIDO MDS3 | Performance concern, Phase 2 |
+| O-06 | FIDO2 Attestation verification với FIDO MDS3, trusted roots và provenance phần cứng | Phase 2; v1 chọn `attestation: "none"` để giảm operational complexity và không dùng attestation statement làm bằng chứng provenance |
 | O-07 | Biometrics enrollment UI | Phụ thuộc OS/device |
 
 ---
@@ -214,7 +215,7 @@ Spec này định nghĩa việc tích hợp **FIDO2/WebAuthn (passkey)** vào Au
 Given: User đã xác minh email, chưa có passkey, browser/device hỗ trợ WebAuthn
 When:  POST /fido2/register/begin với user_id hợp lệ
        → User hoàn thành sinh trắc học trên thiết bị
-       → POST /fido2/register/finish với attestation response hợp lệ
+       → POST /fido2/register/finish với WebAuthn registration response hợp lệ (`attestation=none`)
 Then:  HTTP 200
        Body: { "credential_id": "...", "message": "Passkey đã được thêm thành công" }
        DB: fido2_credentials có bản ghi mới với sign_count=0
@@ -590,15 +591,19 @@ Step 1: POST /fido2/register/begin
     - excludeCredentials: [tất cả credential_id của user]  // tránh đăng ký trùng
     - authenticatorSelection.residentKey = "required"       // discoverable credential
     - authenticatorSelection.userVerification = "required"
-    - attestation = "indirect"
+    - attestation = "none"                         // v1 không yêu cầu attestation statement
 
 Step 2: Client gọi navigator.credentials.create(options)
-  Authenticator tạo key pair, lưu private key trong secure enclave
-  Trả về attestationObject + clientDataJSON
+  Authenticator tạo key pair, lưu private key trong authenticator
+  Trả về attestationObject + clientDataJSON; với policy `none`, browser không cung cấp
+  attestation statement/cert chain nào có thể dùng để chứng minh provenance phần cứng.
 
 Step 3: POST /fido2/register/finish
-  Server verify attestation statement (format: none / packed / tpm / android-key / fido-u2f)
-  Server lưu: credential_id, public_key_cose, aaguid, transports, backup_eligible, backup_state
+  Server verify registration theo WebAuthn: challenge, origin, rpIdHash, type, UV flag,
+  credential_id uniqueness, public_key_cose và thuật toán được phép.
+  Server KHÔNG verify attestation statement, KHÔNG gọi FIDO MDS3, KHÔNG tin AAGUID/cert
+  như bằng chứng provenance phần cứng trong v1.
+  Server lưu: credential_id, public_key_cose, aaguid (diagnostic only), transports, backup_eligible, backup_state
   Server xóa challenge khỏi Redis
   Server gửi email xác nhận
 ```
@@ -714,7 +719,7 @@ components:
           properties:
             userVerification: { type: string, enum: [required] }
             residentKey: { type: string, enum: [required] }
-        attestation: { type: string, enum: [none, indirect, direct], default: indirect }
+        attestation: { type: string, enum: [none], default: none, description: "v1 dùng attestation conveyance none; server không validate FIDO MDS3 hoặc dùng attestation statement làm bằng chứng provenance phần cứng" }
 
     RegisterFinishRequest:
       type: object
@@ -870,7 +875,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/RegisterFinishResponse' }
         '400':
-          description: Challenge hết hạn hoặc attestation không hợp lệ
+          description: Challenge hết hạn hoặc WebAuthn registration response không hợp lệ
           content:
             application/json:
               examples:
@@ -1176,7 +1181,7 @@ CREATE TABLE fido2_credentials (
   transports           TEXT[],          -- ['internal','hybrid','usb','nfc','ble']
   backup_eligible      BOOLEAN NOT NULL DEFAULT false,
   backup_state         BOOLEAN NOT NULL DEFAULT false,
-  attestation_format   TEXT,            -- 'none' | 'packed' | 'tpm' | 'android-key' | 'fido-u2f'
+  attestation_format   TEXT,            -- v1 expected 'none'; diagnostic only, không dùng làm provenance
   status               TEXT NOT NULL DEFAULT 'active'
                        CHECK (status IN ('active', 'suspended', 'revoked')),
   created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -1324,8 +1329,9 @@ CREATE INDEX idx_audit_event ON auth_audit_log(event_type, created_at DESC);
 | `userVerification` | `required` | Bắt buộc PIN/biometric, không chỉ user presence |
 | `rpId` | `yourcompany.com` | Không wildcard subdomain |
 | `timeout` | `300000` ms | 5 phút — đủ cho user thao tác |
-| `attestation` | `indirect` | Verify qua FIDO MDS, không trực tiếp process cert chain |
+| `attestation` | `none` | v1 không thu thập/verify attestation statement, không gọi FIDO MDS3, và không dùng AAGUID/cert chain làm bằng chứng provenance phần cứng |
 | `residentKey` | `required` | Discoverable credential — login không cần nhập username |
+| Hardware provenance | Không được chứng minh bằng attestation trong v1 | Scope high-assurance như `admin:write` không được grant chỉ dựa trên attestation statement; cần policy bổ sung hoặc Phase 2 MDS3 |
 
 ### Rate Limiting
 
@@ -1744,6 +1750,36 @@ RFC 7636 định nghĩa hai method: `plain` (code_verifier = code_challenge) và
 
 ---
 
+### ADR-006: Chọn `attestation: "none"` cho v1 và defer FIDO MDS3
+
+**Status:** Accepted\
+**Date:** 2026-05-16\
+**Deciders:** Security Lead, Backend Lead, Infra Lead
+
+**Context:**
+Registration có thể yêu cầu attestation để xác minh model authenticator và provenance phần cứng qua FIDO Metadata Service v3 (MDS3). Lựa chọn này tăng assurance, nhưng kéo theo vận hành trusted roots, refresh metadata định kỳ, cache, xử lý outage, revocation/status report và latency khi registration. v1 cần passkey rollout ổn định, latency thấp và ít dependency vận hành.
+
+**Quyết định:** v1 dùng WebAuthn `attestation: "none"`. Server không validate FIDO MDS3, không xử lý attestation certificate chain/trusted roots, và không dùng attestation statement/AAGUID/cert chain làm bằng chứng provenance phần cứng.
+
+**Hệ quả bảo mật:**
+- Registration vẫn verify các yêu cầu WebAuthn core: challenge, origin, rpIdHash, type, UV flag, credential uniqueness, public key và thuật toán được phép.
+- AAGUID và transports chỉ dùng cho diagnostic/risk analytics, không dùng để grant assurance level.
+- Không thể chứng minh bằng cryptographic metadata rằng credential đến từ hardware authenticator cụ thể trong v1.
+
+**Tác động đến high-assurance scope (`admin:write`):**
+- `admin:write` không được cấp chỉ vì registration response có attestation-like data; v1 coi dữ liệu đó là không đáng tin cho provenance.
+- Nếu business bắt buộc hardware provenance cho `admin:write`, endpoint phải trả `insufficient_assurance` cho đến khi có policy ngoài luồng được Security phê duyệt hoặc Phase 2 MDS3 được triển khai.
+- Tín hiệu như `backup_state=false` có thể dùng để giảm rủi ro synced passkey, nhưng không thay thế MDS3 attestation verification.
+
+**Trade-offs:**
+- Ưu điểm: giảm dependency vận hành, tránh failure mode khi MDS/cache/trusted roots lỗi, registration nhanh và dễ rollout hơn.
+- Nhược điểm: không có provenance phần cứng trong v1; một số use case high-assurance phải bị hạn chế hoặc cần exception được audit.
+
+**Follow-up Phase 2 (ngoài scope v1):**
+Khi đưa MDS3 vào scope, cần thiết kế metadata refresh schedule, signed TOC verification, cache TTL/stale behavior, failure handling, trusted roots management, status report handling và monitoring.
+
+---
+
 ## 17. Traceability Matrix
 
 > Bảng này link từng User Story → Acceptance Criteria → Endpoint → DB Table → NFR để đảm bảo không có gì bị bỏ sót khi requirement thay đổi.
@@ -1791,7 +1827,8 @@ RFC 7636 định nghĩa hai method: `plain` (code_verifier = code_challenge) và
 | Origin mismatch (phishing attempt) | /fido2/auth/finish | HTTP 400 | Log ERROR, monitor spike |
 | Challenge timeout | /fido2/auth/finish | HTTP 400 `challenge_expired` | Không, user restart flow |
 | PR > 500 dòng thay đổi | — | Không có | NEEDS_HUMAN review |
-| Attestation format lạ | /fido2/register/finish | Accept nếu `attestation=none`, reject nếu invalid format | Log WARNING |
+| Attestation statement/provenance phần cứng xuất hiện hoặc thiếu | /fido2/register/finish | Với policy `attestation=none`, chỉ verify WebAuthn core fields; không dùng statement/AAGUID/cert chain để chứng minh hardware provenance | Log INFO nếu client gửi dữ liệu ngoài kỳ vọng |
+| Request `admin:write` nhưng credential không có provenance được policy chấp nhận | /fido2/auth/finish hoặc /oauth2/authorize | HTTP 403 `insufficient_assurance`; v1 không coi attestation statement là bằng chứng, Phase 2 MDS3 mới có thể nâng assurance | Security review nếu business cần allowlist tạm |
 | Redis down | Mọi FIDO2 endpoint | HTTP 503 + Retry-After, circuit breaker | PagerDuty alert |
 | DB connection exhausted | Mọi endpoint | HTTP 503, queue request tối đa 30s | PagerDuty alert |
 | Synced passkey cho high-assurance | /fido2/auth/finish | HTTP 403 `insufficient_assurance` | Không, user dùng hardware key |
