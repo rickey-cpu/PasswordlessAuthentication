@@ -638,10 +638,25 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
+    IntrospectionAuth:
+      type: oauth2
+      description: |
+        Confidential/service client authentication for Resource Servers.
+        Use a client credential or service account access token carrying scope `tokens:introspect`;
+        do not use an end-user access token to authenticate this endpoint.
+      flows:
+        clientCredentials:
+          tokenUrl: /oauth2/token
+          scopes:
+            tokens:introspect: Validate and introspect access tokens for Resource Servers.
     AdminAuth:
-      type: http
-      scheme: bearer
-      description: Requires scope=admin:write
+      type: oauth2
+      description: Admin bearer token; accepted on introspection only as an explicit admin override.
+      flows:
+        clientCredentials:
+          tokenUrl: /oauth2/token
+          scopes:
+            admin:write: Administrative write access.
 
   schemas:
     Error:
@@ -998,9 +1013,15 @@ paths:
   /oauth2/introspect:
     post:
       summary: Validate token (dùng cho Resource Server)
+      description: |
+        Resource Server MUST authenticate as a confidential/service client.
+        Required scope is `tokens:introspect`; `admin:write` is accepted only for Admin clients that need
+        to call this endpoint. End-user access tokens MUST NOT be used as the caller credential.
       operationId: introspect
       tags: [oauth2]
-      security: [{ AdminAuth: [] }]
+      security:
+        - IntrospectionAuth: [tokens:introspect]
+        - AdminAuth: [admin:write]
       requestBody:
         required: true
         content:
@@ -1022,6 +1043,28 @@ paths:
                   scope: { type: string }
                   exp: { type: integer }
                   amr: { type: array, items: { type: string } }
+        '401':
+          description: Missing or invalid Resource Server credential
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                missing_credential:
+                  value:
+                    error: invalid_client
+                    message: Missing bearer token or client authentication for token introspection.
+                    request_id: 018f9d0a-91b4-7cc6-a5d2-4b0ed2b7159d
+        '403':
+          description: Caller is authenticated but lacks the required introspection scope
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                missing_scope:
+                  value:
+                    error: insufficient_scope
+                    message: Required scope `tokens:introspect` or admin override scope `admin:write`.
+                    request_id: 018f9d0b-2254-73a5-9c15-3bb7dcda6e62
 
   /oauth2/revoke:
     post:
@@ -1087,7 +1130,7 @@ paths:
       summary: Admin revoke tất cả credential của user
       operationId: adminRevokeAllCredentials
       tags: [admin]
-      security: [{ AdminAuth: [] }]
+      security: [{ AdminAuth: [admin:write] }]
       parameters:
         - name: user_id
           in: path
@@ -1238,8 +1281,10 @@ CREATE INDEX idx_audit_event ON auth_audit_log(event_type, created_at DESC);
 |---|---|---|
 | End user | `openid profile email fido2:register fido2:auth credentials:read credentials:delete offline_access` | Người dùng cuối |
 | Support T2 | `support:read credentials:read audit:read:own` | Nhân viên hỗ trợ tier 2 |
-| Admin | `admin:read admin:write credentials:revoke tokens:revoke tokens:introspect oauth2:clients:manage audit:read` | Quản trị hệ thống |
-| Service account | `tokens:introspect` | Machine-to-machine |
+| Admin | `admin:read admin:write credentials:revoke tokens:revoke oauth2:clients:manage audit:read` + optional `admin:write` override for `/oauth2/introspect` | Quản trị hệ thống |
+| Service account | `tokens:introspect` | Machine-to-machine Resource Server client |
+
+**Introspection rule:** `/oauth2/introspect` requires caller scope `tokens:introspect`. Resource Servers MUST call it with a confidential/service client credential, not an end-user access token. `admin:write` is also accepted only as an Admin override when operators need to introspect tokens.
 
 ### Ma trận quyền
 
@@ -1254,7 +1299,7 @@ CREATE INDEX idx_audit_event ON auth_audit_log(event_type, created_at DESC);
 | DELETE /admin/users/:id/credentials | ✗ | ✗ | ✓ | ✗ |
 | GET /oauth2/authorize | ✓ | ✗ | ✗ | ✗ |
 | POST /oauth2/token | ✓ | ✗ | ✗ | ✗ |
-| POST /oauth2/introspect | ✗ | ✗ | ✓ | ✓ |
+| POST /oauth2/introspect | ✗ | ✗ | ✓ (`admin:write` override) | ✓ (`tokens:introspect`) |
 | POST /oauth2/revoke | ✓ own | ✗ | ✓ any | ✗ |
 | GET /.well-known/jwks.json | ✓ | ✓ | ✓ | ✓ |
 | GET /admin/users/:id | ✗ | ✓ | ✓ | ✗ |
