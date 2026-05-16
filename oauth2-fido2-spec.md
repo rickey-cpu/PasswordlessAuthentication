@@ -294,12 +294,17 @@ Given: User có passkey hợp lệ
 When:  POST /fido2/auth/finish với assertion hợp lệ
 Then:  HTTP 302 redirect → redirect_uri?code={auth_code}&state={state}
        DB: sign_count tăng thêm 1, last_used_at = now()
-       Redis: Challenge bị xóa ngay lập tức
+       Redis: Transaction/challenge bị đánh dấu used và xóa ngay sau khi issue code
+       Redis: auth_code:{code} chứa các OAuth field đã bind từ transaction
 ```
 
 **Sample payload /auth/finish:**
+
+> Khuyến nghị: FIDO2 UI gửi request trong cùng browser session đã nhận cookie `__Host-auth_tx` (HttpOnly, Secure, SameSite=Lax/Strict) từ `GET /oauth2/authorize`. Nếu UI/native client cần reference rõ ràng, truyền thêm `auth_transaction_id` do server cấp; server vẫn phải đối chiếu với server-side session trước khi chấp nhận.
+
 ```json
 {
+  "auth_transaction_id": "atx_01HZY...",
   "id": "mfaFAs7FKdPlBDqo...",
   "rawId": "mfaFAs7FKdPlBDqo...",
   "type": "public-key",
@@ -319,8 +324,8 @@ Given: User gọi /auth/begin thành công
 When:  User gửi /auth/finish với signature bị thay đổi 1 byte
 Then:  HTTP 401
        Body: { "error": "invalid_signature" }
-       Log: WARN | { user_id, ip, user_agent, timestamp, credential_id }
-       Redis: Challenge bị xóa (không thể retry cùng challenge)
+       Log: WARN | { user_id, ip, user_agent, timestamp, credential_id, auth_transaction_id }
+       Redis: Transaction/challenge bị đánh dấu used/failed và xóa (không thể retry cùng challenge)
 ```
 
 #### TC-002-03 — Sign count giảm (clone attack)
@@ -502,42 +507,71 @@ Then:  HTTP 400
 
 ### 7.1 Authorization Code Flow + FIDO2
 
+`GET /oauth2/authorize` là điểm tạo **server-side authentication transaction**. Sau khi validate `client_id`, `redirect_uri`, `scope`, `state`, PKCE và `nonce` (nếu dùng OIDC), Authorization Server tạo `auth_transaction_id` (ví dụ `atx_...`, entropy tối thiểu 128-bit), bind nó với `session_id` hiện tại và lưu toàn bộ OAuth context trong Redis. FIDO2 UI không được tự tái tạo OAuth field từ query string; mọi bước `/fido2/auth/begin` và `/fido2/auth/finish` phải tham chiếu lại transaction đã bind.
+
 ```
-Client                  Auth Server              FIDO2 Engine         Authenticator
-  │                          │                        │                     │
-  │── GET /oauth2/authorize ─►│                        │                     │
-  │   (client_id, scope,      │                        │                     │
-  │    code_challenge, state) │                        │                     │
-  │                           │── Create challenge ───►│                     │
-  │                           │◄─ challenge (32B) ─────│                     │
-  │◄── Redirect to FIDO2 UI ──│                        │                     │
-  │                           │                        │                     │
-  │── POST /fido2/auth/begin ─►│                        │                     │
-  │                           │── Store challenge ────►│(Redis, TTL 5m)      │
-  │◄── PublicKeyCredentialReq ─│                        │                     │
-  │                           │                        │                     │
-  │── navigator.credentials.get() ─────────────────────────────────────────►│
-  │                           │                        │          Sign(challenge,
-  │                           │                        │          private_key)│
-  │◄─────────────────────────────────────────────────── AssertionResponse ───│
-  │                           │                        │                     │
-  │── POST /fido2/auth/finish ─►│                        │                     │
-  │                           │── Verify assertion ───►│                     │
-  │                           │   1. clientDataJSON type, challenge, origin   │
-  │                           │   2. authenticatorData rpIdHash, UV flag      │
-  │                           │   3. sign_count > stored_count                │
-  │                           │   4. verify(pubkey, sig, authData||clientHash)│
-  │                           │◄── VERIFIED ───────────│                     │
-  │                           │── Update sign_count ──►│(DB)                 │
-  │◄── HTTP 302 + auth_code ──│                        │                     │
-  │                           │                        │                     │
-  │── POST /oauth2/token ─────►│                        │                     │
-  │   (code, code_verifier)   │── Verify code_verifier  │                     │
-  │                           │   SHA256(verifier) == challenge               │
-  │◄── access_token (15m) ────│                        │                     │
-  │    refresh_token (7d)     │                        │                     │
-  │    id_token               │                        │                     │
+Client                  Auth Server              FIDO2 Engine         Redis                 Authenticator
+  │                          │                        │                  │                         │
+  │── GET /oauth2/authorize ─►│                        │                  │                         │
+  │   (client_id, scope,      │                        │                  │                         │
+  │    redirect_uri, PKCE,    │                        │                  │                         │
+  │    state, nonce?)         │                        │                  │                         │
+  │                           │── Validate OAuth req ─►│                  │                         │
+  │                           │── Create auth_transaction_id + session_id │                         │
+  │                           │── Store oauth ctx + transaction ─────────►│ TTL 5m                  │
+  │◄── 302 FIDO2 UI + Set-Cookie __Host-auth_tx ───────│                  │                         │
+  │    (optional tx_ref)      │                        │                  │                         │
+  │                           │                        │                  │                         │
+  │── POST /fido2/auth/begin ─►│                        │                  │                         │
+  │   (same cookie, optional  │── Validate transaction/session binding ──►│                         │
+  │    auth_transaction_id)   │── Create FIDO2 challenge ────────────────►│ same auth_tx, TTL 5m    │
+  │◄── PublicKeyCredentialReq + auth_transaction_id ───│                  │                         │
+  │                           │                        │                  │                         │
+  │── navigator.credentials.get() ───────────────────────────────────────────────────────────────►│
+  │                           │                        │                  │          Sign(challenge, │
+  │                           │                        │                  │          private_key)    │
+  │◄──────────────────────────────────────────────────────────────────────── AssertionResponse ───│
+  │                           │                        │                  │                         │
+  │── POST /fido2/auth/finish ─►│                        │                  │                         │
+  │   (assertion + same       │── Load bound transaction/challenge ──────►│                         │
+  │    transaction ref)       │── Reject if missing/expired/mismatch/used │                         │
+  │                           │── Verify assertion ───►│                  │                         │
+  │                           │   1. clientDataJSON type, challenge, origin                         │
+  │                           │   2. authenticatorData rpIdHash, UV flag                            │
+  │                           │   3. sign_count > stored_count                                       │
+  │                           │   4. verify(pubkey, sig, authData||clientHash)                       │
+  │                           │◄── VERIFIED ───────────│                  │                         │
+  │                           │── Update sign_count ──►│(DB)              │                         │
+  │                           │── Issue auth_code only for bound tx ─────►│ auth_code copies bound OAuth ctx
+  │                           │── Mark tx used/delete challenge ────────►│ anti-replay             │
+  │◄── HTTP 302 + auth_code ──│                        │                  │                         │
+  │                           │                        │                  │                         │
+  │── POST /oauth2/token ─────►│                        │                  │                         │
+  │   (code, code_verifier)   │── Verify code_verifier against copied PKCE                         │
+  │                           │   SHA256(verifier) == code_challenge                                 │
+  │◄── access_token (15m) ────│                        │                  │                         │
+  │    refresh_token (7d)     │                        │                  │                         │
+  │    id_token               │                        │                  │                         │
 ```
+
+**Transaction binding rules:**
+
+- `auth_transaction_id` được tạo duy nhất tại `GET /oauth2/authorize`; không chấp nhận ID do client tự sinh.
+- Redis transaction phải lưu: `client_id`, `redirect_uri` đã validate/canonicalized, `scope`, `state`, `code_challenge`, `code_challenge_method`, `nonce` (nếu OIDC), `session_id`, `created_at`, `expires_at`, `status=pending`, và FIDO2 challenge metadata (`challenge_b64`, `rp_id`, `origin`, `allow_credentials`, `user_verification`, `challenge_created_at`).
+- FIDO2 UI ưu tiên dùng cookie server-side `__Host-auth_tx`/`session_id` với `HttpOnly`, `Secure`, `SameSite=Lax` hoặc `Strict`. `auth_transaction_id` trong body/query chỉ là transaction reference để debug/mobile-deep-link và phải khớp với cookie/session đã bind.
+- `/fido2/auth/begin` chỉ tạo FIDO2 auth challenge cho transaction `pending` còn hạn và cùng `session_id`; nếu transaction đã có challenge chưa hết hạn thì rotate challenge cũ và đánh dấu cũ là unusable.
+- `/fido2/auth/finish` chỉ được issue authorization code khi assertion hợp lệ **và** transaction vẫn `pending`, cùng `session_id`, cùng `auth_transaction_id`, challenge chưa hết hạn và chưa dùng. Khi tạo `auth_code:{code}`, server copy OAuth field đã bind từ transaction (`client_id`, `redirect_uri`, `scope`, `state`, `code_challenge`, `code_challenge_method`, `nonce`) thay vì lấy từ request `/finish`.
+- Sau khi issue code hoặc khi verification thất bại không thể retry an toàn, transaction/challenge phải được đánh dấu `used`/`failed` bằng thao tác atomic (ví dụ Redis Lua/SET NX state transition) rồi xóa hoặc giữ tombstone TTL ngắn để chặn replay.
+
+**Reject cases bắt buộc:**
+
+| Trường hợp | HTTP | Error | Ghi chú |
+|---|---:|---|---|
+| Thiếu cookie/session hoặc thiếu transaction reference khi endpoint yêu cầu | 400 | `missing_auth_transaction` | Không bắt đầu WebAuthn nếu không có transaction OAuth đã bind |
+| `auth_transaction_id` không tồn tại hoặc TTL hết hạn | 400 | `auth_transaction_expired` | User phải restart từ `/oauth2/authorize` |
+| Transaction không khớp `session_id`, cookie, `client_id` context hoặc challenge trong assertion | 400 | `auth_transaction_mismatch` | Log WARN, không issue code |
+| Transaction/challenge đã `used`, `failed` hoặc có replay cùng assertion | 400 | `auth_transaction_replayed` | Không cho retry cùng challenge |
+| `/finish` hợp lệ về FIDO2 nhưng transaction chưa được bind từ `/authorize` | 400 | `unbound_auth_transaction` | Không tạo `auth_code` |
 
 ### 7.2 FIDO2 Verification Logic (RFC W3C §7.2)
 
@@ -577,8 +611,9 @@ Step 6: Verify signature
 
 Step 7: On success
   → Update sign_count in DB
-  → Delete challenge from Redis
-  → Issue authorization_code
+  → Atomically mark auth_tx as used and delete/expire FIDO2 challenge metadata
+  → Issue authorization_code only from the bound auth_tx OAuth context
+  → Persist auth_code:{code} with copied client_id, redirect_uri, scope, state, PKCE, nonce
 ```
 
 ### 7.3 Registration Ceremony
@@ -727,12 +762,23 @@ components:
     # --- Authentication ---
     AuthBeginRequest:
       type: object
+      description: |
+        FIDO2 UI phải gọi endpoint này trong cùng server-side browser session đã được tạo bởi
+        GET /oauth2/authorize. Cookie HttpOnly/SameSite là nguồn bind chính; auth_transaction_id
+        chỉ là transaction reference rõ ràng cho UI/native client và phải khớp với session.
       properties:
+        auth_transaction_id:
+          type: string
+          pattern: '^atx_[A-Za-z0-9_-]{22,}$'
+          description: Optional khi cookie __Host-auth_tx hiện diện; bắt buộc cho native/deep-link flow.
         user_id: { type: string, format: uuid, description: Để trống nếu dùng discoverable credential }
 
     AuthBeginResponse:
       type: object
       properties:
+        auth_transaction_id:
+          type: string
+          description: Server-issued transaction reference đã bind với session; echo lại để UI gửi /finish khi cần.
         challenge: { type: string, format: base64url }
         timeout: { type: integer, example: 300000 }
         rpId: { type: string, example: yourcompany.com }
@@ -749,7 +795,14 @@ components:
     AuthFinishRequest:
       type: object
       required: [id, rawId, type, response]
+      description: |
+        Hoàn tất assertion trong transaction đã bind. Server chỉ issue authorization code nếu
+        auth_transaction_id/cookie/session khớp với transaction pending và challenge chưa dùng.
       properties:
+        auth_transaction_id:
+          type: string
+          pattern: '^atx_[A-Za-z0-9_-]{22,}$'
+          description: Optional khi cookie __Host-auth_tx đủ để lookup; nếu truyền thì phải khớp tuyệt đối.
         id: { type: string, format: base64url }
         rawId: { type: string, format: base64url }
         type: { type: string, enum: [public-key] }
@@ -873,10 +926,19 @@ paths:
             schema: { $ref: '#/components/schemas/AuthBeginRequest' }
       responses:
         '200':
-          description: PublicKeyCredentialRequestOptions
+          description: PublicKeyCredentialRequestOptions kèm transaction reference đã bind
           content:
             application/json:
               schema: { $ref: '#/components/schemas/AuthBeginResponse' }
+        '400':
+          description: Transaction thiếu, hết hạn, không khớp hoặc replay
+          content:
+            application/json:
+              examples:
+                missing_tx: { value: { error: missing_auth_transaction } }
+                expired_tx: { value: { error: auth_transaction_expired } }
+                mismatch_tx: { value: { error: auth_transaction_mismatch } }
+                replayed_tx: { value: { error: auth_transaction_replayed } }
         '429':
           description: Rate limit — 5 lần/phút/IP
           headers:
@@ -894,17 +956,24 @@ paths:
             schema: { $ref: '#/components/schemas/AuthFinishRequest' }
       responses:
         '302':
-          description: Redirect về client kèm authorization_code
+          description: |
+            Redirect về client kèm authorization_code. Code chỉ được issue cho transaction đã bind;
+            auth_code:{code} phải copy client_id, redirect_uri, scope, state, PKCE và nonce từ Redis transaction.
           headers:
             Location: { schema: { type: string, format: uri } }
         '400':
-          description: Origin mismatch, challenge expired, UV=0
+          description: Origin mismatch, challenge expired, UV=0, hoặc auth transaction không hợp lệ
           content:
             application/json:
               examples:
                 origin: { value: { error: origin_mismatch } }
                 expired: { value: { error: challenge_expired } }
                 uv: { value: { error: user_verification_required } }
+                missing_tx: { value: { error: missing_auth_transaction } }
+                expired_tx: { value: { error: auth_transaction_expired } }
+                mismatch_tx: { value: { error: auth_transaction_mismatch } }
+                replayed_tx: { value: { error: auth_transaction_replayed } }
+                unbound_tx: { value: { error: unbound_auth_transaction } }
         '401':
           description: Signature không hợp lệ hoặc sign_count anomaly
           content:
@@ -967,8 +1036,19 @@ paths:
         - { name: state, in: query, required: true, schema: { type: string, minLength: 16 } }
         - { name: code_challenge, in: query, required: true, schema: { type: string, format: base64url } }
         - { name: code_challenge_method, in: query, required: true, schema: { type: string, enum: [S256] } }
+        - { name: nonce, in: query, required: false, schema: { type: string, minLength: 16 }, description: Bắt buộc khi scope chứa openid nếu policy OIDC yêu cầu nonce }
       responses:
-        '302': { description: Redirect đến FIDO2 authentication UI }
+        '302':
+          description: |
+            Redirect đến FIDO2 authentication UI sau khi tạo auth_transaction_id server-side,
+            bind với session_id và lưu OAuth context đã validate trong Redis.
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+              description: FIDO2 UI URL; có thể chứa tx_ref ngắn, không chứa OAuth secret/context.
+            Set-Cookie:
+              schema: { type: string }
+              description: __Host-auth_tx=<opaque>; HttpOnly; Secure; SameSite=Lax hoặc Strict; TTL 5m.
         '400': { description: Request không hợp lệ (missing param, invalid redirect_uri) }
 
   /oauth2/token:
@@ -1220,12 +1300,37 @@ CREATE INDEX idx_audit_event ON auth_audit_log(event_type, created_at DESC);
 -- =====================================================
 -- Redis Keys (không phải DB table — documentation only)
 -- =====================================================
--- Key: "challenge:reg:{session_id}"    Value: { challenge_b64, user_id }  TTL: 300s
--- Key: "challenge:auth:{session_id}"   Value: { challenge_b64, user_id }  TTL: 300s
--- Key: "auth_code:{code}"              Value: { user_id, client_id, scope, redirect_uri, code_challenge, amr }  TTL: 600s
+-- Key: "challenge:reg:{session_id}"
+--   Value: { challenge_b64, user_id, created_at, rp_id, origin }
+--   TTL: 300s
+--
+-- Key: "auth_tx:{auth_transaction_id}"
+--   Value: {
+--     session_id, status: "pending" | "used" | "failed", created_at, expires_at,
+--     client_id, redirect_uri_validated, scope, state,
+--     code_challenge, code_challenge_method, nonce,
+--     fido2: {
+--       challenge_b64, challenge_created_at, rp_id, origin,
+--       allow_credentials, user_verification, timeout_ms
+--     }
+--   }
+--   TTL: 300s while pending; tombstone TTL 60s after used/failed to reject replay
+--
+-- Key: "challenge:auth:{session_id}"
+--   Deprecated: chỉ dùng migration. Auth challenge mới phải nằm trong auth_tx:{auth_transaction_id}
+--   để bind OAuth context + FIDO2 challenge atomically. TTL: 300s
+--
+-- Key: "auth_code:{code}"
+--   Value: {
+--     user_id, client_id, redirect_uri, scope, state,
+--     code_challenge, code_challenge_method, nonce,
+--     auth_transaction_id, session_id, amr: ["fido2"], issued_at
+--   }
+--   TTL: 600s; tất cả OAuth field phải copy từ auth_tx đã bind, không lấy từ /fido2/auth/finish
+--
 -- Key: "recovery_otp:{email_hash}"     Value: { otp_hash, attempts }      TTL: 600s
 -- Key: "recovery_token:{token_hash}"   Value: { user_id }                 TTL: 900s
--- Key: "session:{session_id}"          Value: { user_id, created_at }     TTL: 3600s
+-- Key: "session:{session_id}"          Value: { user_id, created_at, auth_transaction_id? } TTL: 3600s
 ```
 
 ---
