@@ -290,11 +290,11 @@ Then:  HTTP 429
 #### TC-002-01 — Đăng nhập thành công
 
 ```
-Given: User có passkey hợp lệ
+Given: User có passkey hợp lệ, DB lưu sign_count = 5
        GET /oauth2/authorize với PKCE đúng chuẩn (S256)
-When:  POST /fido2/auth/finish với assertion hợp lệ
+When:  POST /fido2/auth/finish với assertion hợp lệ và authenticator trả về sign_count = 6
 Then:  HTTP 302 redirect → redirect_uri?code={auth_code}&state={state}
-       DB: sign_count tăng thêm 1, last_used_at = now()
+       DB: sign_count = 6, last_used_at = now() (persist đúng 1 lần sau khi verify signature thành công)
        Redis: Transaction/challenge bị đánh dấu used và xóa ngay sau khi issue code
        Redis: auth_code:{code} chứa các OAuth field đã bind từ transaction
 ```
@@ -325,6 +325,7 @@ Given: User gọi /auth/begin thành công
 When:  User gửi /auth/finish với signature bị thay đổi 1 byte
 Then:  HTTP 401
        Body: { "error": "invalid_signature" }
+       DB: sign_count không đổi (không compare/persist counter khi signature chưa hợp lệ)
        Log: WARN | { user_id, ip, user_agent, timestamp, credential_id, auth_transaction_id }
        Redis: Transaction/challenge bị đánh dấu used/failed và xóa (không thể retry cùng challenge)
 ```
@@ -333,10 +334,11 @@ Then:  HTTP 401
 
 ```
 Given: DB lưu sign_count = 5 cho credential X
-When:  Authenticator trả về sign_count = 3 trong assertion
+When:  Assertion có signature hợp lệ nhưng authenticator trả về sign_count = 3
 Then:  HTTP 401
        Body: { "error": "sign_count_anomaly" }
-       DB: credential status = "suspended"
+       DB: credential status = "suspended"; sign_count vẫn = 5 (KHÔNG ghi đè bằng 3)
+       Redis: Transaction/challenge bị đánh dấu used/failed và xóa (không thể retry cùng challenge)
        Alert: #security-alerts nhận thông báo ngay lập tức
        Log: ERROR | { credential_id, expected_min: 6, received: 3 }
 ```
@@ -538,11 +540,11 @@ Client                  Auth Server              FIDO2 Engine         Redis     
   │    transaction ref)       │── Reject if missing/expired/mismatch/used │                         │
   │                           │── Verify assertion ───►│                  │                         │
   │                           │   1. clientDataJSON type, challenge, origin                         │
-  │                           │   2. authenticatorData rpIdHash, UV flag                            │
-  │                           │   3. sign_count > stored_count                                       │
-  │                           │   4. verify(pubkey, sig, authData||clientHash)                       │
+  │                           │   2. authenticatorData rpIdHash, UP, UV flags                       │
+  │                           │   3. verify(pubkey, sig, authData||clientHash)                       │
+  │                           │   4. compare sign_count after valid signature                        │
   │                           │◄── VERIFIED ───────────│                  │                         │
-  │                           │── Update sign_count ──►│(DB)              │                         │
+  │                           │── Persist sign_count once ─►│(DB)          │                         │
   │                           │── Issue auth_code only for bound tx ─────►│ auth_code copies bound OAuth ctx
   │                           │── Mark tx used/delete challenge ────────►│ anti-replay             │
   │◄── HTTP 302 + auth_code ──│                        │                  │                         │
@@ -580,12 +582,13 @@ Client                  Auth Server              FIDO2 Engine         Redis     
 Input: assertionResponse = { id, rawId, response: { authenticatorData, clientDataJSON, signature, userHandle } }
 
 Step 1: Parse clientDataJSON
-  C = JSON.parse(base64url_decode(clientDataJSON))
+  clientDataJSON_bytes = base64url_decode(clientDataJSON)
+  C = JSON.parse(clientDataJSON_bytes)
   Assert C.type === "webauthn.get"
   Assert bytes_equal(base64url_decode(C.challenge), stored_challenge)  // byte compare, NOT string
   Assert C.origin === "https://yourdomain.com"
 
-Step 2: Compute hash
+Step 2: Compute clientDataHash
   clientDataHash = SHA-256(clientDataJSON_bytes)
 
 Step 3: Resolve credential record before trust decisions
@@ -597,33 +600,38 @@ Step 3: Resolve credential record before trust decisions
     Assert userHandle maps to credential.user_id and the bound OAuth login subject
 
 Step 4: Parse authenticatorData
-  rpIdHash = authenticatorData[0:32]
-  flags = authenticatorData[32]
-  signCount = authenticatorData[33:37] (big-endian uint32)
+  authenticatorData_bytes = base64url_decode(authenticatorData)
+  rpIdHash = authenticatorData_bytes[0:32]
+  flags = authenticatorData_bytes[32]
+  signCount = authenticatorData_bytes[33:37] (big-endian uint32)
 
-Step 5: Verify authenticatorData
+Step 5: Verify authenticatorData before trusting counters
   Assert rpIdHash === SHA-256("yourdomain.com")
   Assert flags.UP === 1       // User Presence required
   Assert flags.UV === 1       // User Verification required (policy: required)
   Assert unexpected extension outputs are ignored unless allowlisted by policy
 
-Step 6: Verify signature before mutating persistent state
-  verificationData = authenticatorData || clientDataHash
+Step 6: Verify signature before comparing sign_count or mutating persistent state
+  verificationData = authenticatorData_bytes || clientDataHash
   publicKey = credential.public_key_cose  // from DB, converted to verifier-native key
   Assert verify_signature(publicKey, signature, verificationData) === true
 
-Step 7: Verify sign count and update atomically
+Step 7: Compare sign_count only after signature is valid
   If signCount > 0 AND stored_sign_count > 0 AND signCount <= stored_sign_count:
     → REJECT: sign_count_anomaly
-    → Suspend credential, alert security, mark auth_tx failed/used to block replay
-  Else:
-    → Update credential.sign_count = max(stored_sign_count, signCount)
-    → Update credential.last_used_at = now()
+    → Suspend credential
+    → Atomically mark auth_tx failed/used and delete/expire FIDO2 challenge metadata
+    → Alert security
+    → DO NOT update sign_count (keep stored_sign_count unchanged)
+    → STOP
+
+  next_sign_count = max(stored_sign_count, signCount)
   Note: Some synced/passkey authenticators may report signCount=0. Do not reject 0 solely
   because it is not greater than stored_count; rely on challenge one-time-use, UV, signature,
   risk policy, and audit monitoring for those authenticators.
 
 Step 8: On success
+  → Persist exactly once: update credential.sign_count = next_sign_count, last_used_at = now()
   → Atomically mark auth_tx as used and delete/expire FIDO2 challenge metadata
   → Issue authorization_code only from the bound auth_tx OAuth context
   → Persist auth_code:{code} with copied client_id, redirect_uri, scope, state, PKCE, nonce
